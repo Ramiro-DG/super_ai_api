@@ -2,32 +2,12 @@ from darts.models import AutoARIMA, ExponentialSmoothing, Prophet
 from darts import TimeSeries
 from darts.utils.missing_values import fill_missing_values
 from fastapi import FastAPI
+from datetime import datetime
+from sklearn.cluster import KMeans, MeanShift
+from sklearn.preprocessing import StandardScaler
+from datetime import datetime, timedelta
 import psycopg2
 import pandas as pd
-
-from datetime import datetime, timedelta
-
-def generate_logical_sales_dataset():
-    start_date = datetime(2023, 1, 1)
-    
-    # Create a pattern of increasing and decreasing sales
-    base_pattern = [15, 22, 30, 40, 35, 25, 18, 12, 20, 28, 38, 45]
-    
-    data = []
-    for month in range(12):
-        month_start = start_date + timedelta(days=month*30)
-        
-        # Vary daily sales within a 20% range of the monthly base number
-        for day in range(30):
-            current_date = month_start + timedelta(days=day)
-            quantity = max(1, base_pattern[month] + int((day - 15) * 0.5))
-            
-            data.append({
-                'date': current_date,
-                'quantity': quantity
-            })
-    print(pd.DataFrame(data))
-    return pd.DataFrame(data)
 
 app = FastAPI()
 # ! Should this be opened and closed for each request?
@@ -42,7 +22,11 @@ def format_series_data(db_response, connector_cursor):
 
 def complete_missing_data(df_raw_data):
     # Fill missing dates with 0 quantity
-    all_dates = pd.date_range(start=df_raw_data['date'].min(), end=df_raw_data['date'].max(), freq='D')
+    print(df_raw_data)
+    date_start = str(df_raw_data['date'].min())
+    date_end = datetime.now().strftime('%Y-%m-%d')
+
+    all_dates = pd.date_range(start=date_start, end=date_end, freq='D')
     all_dates = pd.DataFrame(all_dates, columns=['date'])
     all_dates['date'] = all_dates['date'].dt.strftime('%Y-%m-%d')
 
@@ -106,6 +90,7 @@ def predict_sales(barcode: int):
 
         raw_data = format_series_data(db_response, cur)
 
+
         aarima_forecast = autoARIMA_model(raw_data)
         exp_smoothing_forecast = exp_smoothing_model(raw_data)
         prophet_forecast = prophet_model(raw_data)
@@ -117,5 +102,175 @@ def predict_sales(barcode: int):
         "prophet": convert_to_dict_round_values(prophet_forecast)
     }
 
+@app.get("/predict_category_sales/{cat_id}")
+def predict_sales(cat_id: int):
+    with conn.cursor() as cur:
+        cur.execute(f"""select DATE(sale.created_at) as date, sum(sale_line.quantity) as quantity 
+                    from sale_line 
+                    inner join product_has_category
+                    on product_has_category.product_id = sale_line.product_id
+                    inner join sale
+                    on sale.id = sale_line.sale_id
+                    where product_has_category.category_id = {cat_id} and (sale.created_at > (now() - interval '3 years'))
+                    group by DATE(sale.created_at);""")
+        db_response = cur.fetchall()
+        cur.close()
+        raw_data = format_series_data(db_response, cur)
+
+
+        aarima_forecast = autoARIMA_model(raw_data)
+        exp_smoothing_forecast = exp_smoothing_model(raw_data)
+        prophet_forecast = prophet_model(raw_data)
     
-# conn.close()
+
+    return {
+        "auto_arima": convert_to_dict_round_values(aarima_forecast),
+        "exp_smoothing": convert_to_dict_round_values(exp_smoothing_forecast),
+        "prophet": convert_to_dict_round_values(prophet_forecast)
+    }
+
+@app.get("/client_retention")
+def client_retention():
+#   graph que muestre por cliente x=num compras; y=monto con cuadrantes en color... 
+#       (permite ver si los clientes gralmente vuelven a hacer compras (RETENCION DEL CLIENTE))
+#           -deberia agarrar el la media matematica o la mediana???
+
+    with conn.cursor() as cur:
+        cur.execute(f"""SELECT count(*), client_id, sum(sl.quantity*sl.unit_price) as spent, max(sl.quantity*sl.unit_price) as max_spent
+                    , min(sl.quantity*sl.unit_price) as min_spent, max(s.created_at) as last_sale
+                    from sale s
+                    inner join sale_line sl
+                        on s.id= sl.sale_id
+                    group by client_id;""")
+        db_response = cur.fetchall()
+        cur.close()
+    column_names = [desc[0] for desc in cur.description]
+    db_response = [dict(zip(column_names, row)) for row in db_response]
+    return db_response
+
+@app.get("/sales_behaviour")
+def sales_behaviour():
+#   analizando CADA COMPRA (COMPORTAMIENTO DE LA DEMANDA)
+
+    with conn.cursor() as cur:
+        cur.execute(f"""SELECT count(sl.id) as item_amount, s.id as sale_id, sum(sl.quantity*sl.unit_price) as sale_total
+                    from sale s
+                    inner join sale_line sl
+                    on s.id= sl.sale_id
+                    group by s.id;""")
+        db_response = cur.fetchall()
+        cur.close()
+    column_names = [desc[0] for desc in cur.description]
+    db_response = [dict(zip(column_names, row)) for row in db_response]
+
+    return db_response
+
+@app.get("/client_clusters")
+def client_clusters():
+# should I be doing the clustering with the client_id?
+
+    with conn.cursor() as cur:
+        cur.execute(f"""select client_id, category_id, sum(quantity) as quantity 
+                    from sale_line
+                    inner join product_has_category
+                    on sale_line.product_id = product_has_category.product_id
+                    inner join sale
+                    on sale_line.sale_id = sale.id
+                    where sale.created_at > (now() - interval '1 years')
+                    group by client_id, category_id;""")
+        ticket_x_category_quantity = cur.fetchall()
+        df_ticket_x_category_quantity = pd.DataFrame(ticket_x_category_quantity, columns=['client_id', 'category_id', 'quantity'])
+        cur.close()
+    
+    with conn.cursor() as cur:
+        cur.execute(f"""select id, name from category order by id asc;""")
+        all_categories = cur.fetchall()
+        df_all_categories = pd.DataFrame(all_categories, columns=['category_id', 'category_name'])
+        cur.close()
+    
+    cols= df_all_categories['category_id'].tolist()
+    col_names = df_all_categories['category_name'].tolist()
+    df_merged = pd.DataFrame(columns=cols, index=df_ticket_x_category_quantity['client_id'].unique())
+
+    for i in range(len(ticket_x_category_quantity)):
+        row= df_ticket_x_category_quantity.iloc[i]
+        df_merged.loc[row['client_id'], row['category_id']] = row['quantity']
+    df_merged = df_merged.fillna(0)
+
+    scaler = StandardScaler()
+    df_merged_scaled = scaler.fit_transform(df_merged)
+
+    inertia = []
+    for k in range(1, 12):
+        kmeans = KMeans(n_clusters=k, random_state=1337)
+        kmeans.fit(df_merged_scaled)
+        inertia.append(kmeans.inertia_)
+    
+    inertia_diff = [inertia[i-1] - inertia[i] for i in range(1, len(inertia))]
+    optimal_k = inertia_diff.index(max(inertia_diff)) + 3 
+
+    kmeans = KMeans(n_clusters=optimal_k, random_state=1337)
+    clusters = kmeans.fit_predict(df_merged)
+
+    df_merged.columns = col_names
+    df_merged['cluster'] = clusters
+
+    cluster_averages = df_merged.groupby('cluster').mean().round(0)
+
+    return {
+        "clusters_data":cluster_averages.to_dict('index')
+    }
+
+@app.get("/sales_clusters")
+def sales_clusters():
+    with conn.cursor() as cur:
+        cur.execute(f"""select sale_id, category_id, sum(quantity) as quantity 
+                    from sale_line
+                    inner join product_has_category
+                    on sale_line.product_id = product_has_category.product_id
+                    inner join sale
+                    on sale_line.sale_id = sale.id
+                    where sale.created_at > (now() - interval '1 years')
+                    group by sale_id, category_id;""")
+        ticket_x_category_quantity = cur.fetchall()
+        df_ticket_x_category_quantity = pd.DataFrame(ticket_x_category_quantity, columns=['sale_id', 'category_id', 'quantity'])
+        cur.close()
+    
+    with conn.cursor() as cur:
+        cur.execute(f"""select id, name from category;""")
+        all_categories = cur.fetchall()
+        df_all_categories = pd.DataFrame(all_categories, columns=['category_id', 'category_name'])
+        cur.close()
+    
+    cols= df_all_categories['category_id'].tolist()
+    col_names = df_all_categories['category_name'].tolist()
+    df_merged = pd.DataFrame(columns=cols, index=df_ticket_x_category_quantity['sale_id'].unique())
+
+    for i in range(len(ticket_x_category_quantity)):
+        row= df_ticket_x_category_quantity.iloc[i]
+        df_merged.loc[row['sale_id'], row['category_id']] = row['quantity']
+    df_merged = df_merged.fillna(0)
+
+    scaler = StandardScaler()
+    df_merged_scaled = scaler.fit_transform(df_merged)
+
+    inertia = []
+    for k in range(1, 12):
+        kmeans = KMeans(n_clusters=k, random_state=1337)
+        kmeans.fit(df_merged_scaled)
+        inertia.append(kmeans.inertia_)
+    print(inertia)
+    inertia_diff = [inertia[i-1] - inertia[i] for i in range(1, len(inertia))]
+    optimal_k = inertia_diff.index(max(inertia_diff)) + 3 
+
+    kmeans = KMeans(n_clusters=optimal_k, random_state=1337)
+    clusters = kmeans.fit_predict(df_merged)
+
+    df_merged.columns = col_names
+    df_merged['cluster'] = clusters
+
+    cluster_averages = df_merged.groupby('cluster').mean().round(0)
+
+    return {
+        "clusters_data":cluster_averages.to_dict('index')
+    }

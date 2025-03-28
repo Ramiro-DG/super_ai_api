@@ -6,11 +6,27 @@ from datetime import datetime
 from sklearn.cluster import KMeans, MeanShift
 from sklearn.preprocessing import StandardScaler
 from datetime import datetime, timedelta
+from fastapi.middleware.cors import CORSMiddleware
 import psycopg2
 import pandas as pd
 
+
 app = FastAPI()
 # ! Should this be opened and closed for each request?
+origins = [
+    "http://localhost",
+    "http://localhost:8080",
+    "http://localhost:5173",
+    "http://localhost:8000",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 conn = psycopg2.connect('postgresql://postgres:postgres@localhost:5432/super')
 
 def format_series_data(db_response, connector_cursor):

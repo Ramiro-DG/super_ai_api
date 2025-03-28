@@ -1,4 +1,4 @@
-# Pasos para instalar API:
+# Pasos para instalar API (Windows):
 ## 1. Instalar [Python 3.10.11](https://www.python.org/downloads/release/python-31011/)
 ## 2. Clonar repositorio de la API
 ```
